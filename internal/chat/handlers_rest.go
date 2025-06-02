@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"blinkchat-backend/internal/models" // Use your actual module path
-	"blinkchat-backend/internal/store"  // Use your actual module path
-	// "blinkchat-backend/internal/websocket" // We'll need this when integrating WebSocket broadcasts
+	"blinkchat-backend/internal/models"    // Use your actual module path
+	"blinkchat-backend/internal/store"     // Use your actual module path
+	"blinkchat-backend/internal/websocket" // Use your actual module path
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -19,17 +19,17 @@ import (
 type RestHandler struct {
 	chatStore    store.ChatStore
 	messageStore store.MessageStore
-	userStore    store.UserStore // Added to fetch user details if needed, e.g., for participants
-	// wsHub        *websocket.Hub // To broadcast new messages; add when WebSocketHub is ready
+	userStore    store.UserStore
+	wsHub        *websocket.Hub // Added WebSocket Hub
 }
 
 // NewRestHandler creates a new RestHandler.
-func NewRestHandler(cs store.ChatStore, ms store.MessageStore, us store.UserStore /*, hub *websocket.Hub */) *RestHandler {
+func NewRestHandler(cs store.ChatStore, ms store.MessageStore, us store.UserStore, hub *websocket.Hub) *RestHandler {
 	return &RestHandler{
 		chatStore:    cs,
 		messageStore: ms,
 		userStore:    us,
-		// wsHub:        hub,
+		wsHub:        hub, // Store the Hub
 	}
 }
 
@@ -51,26 +51,18 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 	}
 
 	var chatID uuid.UUID
-	var _ *models.Chat
+	var createdChat *models.Chat // To hold newly created chat if any
 
-	if req.ChatID != nil { // Client provided a ChatID
+	if req.ChatID != nil {
 		chatID = *req.ChatID
-		// Optional: Validate if sender is part of this chatID (complex, might be skipped for MVP)
-		// chat, err = h.chatStore.GetChatByID(c.Request.Context(), chatID)
-		// if err != nil { ... handle not found or other errors ... }
-	} else if req.ReceiverID != nil { // Client provided a ReceiverID (for 1:1 chat)
+	} else if req.ReceiverID != nil {
 		receiverID := *req.ReceiverID
 		if senderID == receiverID {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot send message to yourself in this context"})
 			return
 		}
 
-		// Find or create 1:1 chat
 		participantIDs := []uuid.UUID{senderID, receiverID}
-		// Ensure consistent order for lookup if your GetChatByParticipantIDs relies on it
-		// For example, sort participantIDs before calling GetChatByParticipantIDs
-		// sort.Slice(participantIDs, func(i, j int) bool { return participantIDs[i].String() < participantIDs[j].String() })
-
 		existingChat, err := h.chatStore.GetChatByParticipantIDs(c.Request.Context(), participantIDs)
 		if err != nil && !errors.Is(err, store.ErrChatNotFound) {
 			log.Printf("PostMessage: Error finding chat for participants %v: %v", participantIDs, err)
@@ -80,9 +72,7 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 
 		if existingChat != nil {
 			chatID = existingChat.ID
-			_ = existingChat
 		} else {
-			// Create new 1:1 chat
 			newChat, err := h.chatStore.CreateChat(c.Request.Context(), participantIDs)
 			if err != nil {
 				log.Printf("PostMessage: Error creating chat for participants %v: %v", participantIDs, err)
@@ -90,7 +80,7 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 				return
 			}
 			chatID = newChat.ID
-			_ = newChat
+			createdChat = newChat // Store the newly created chat
 		}
 	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Either chatId or receiverId must be provided"})
@@ -104,7 +94,7 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 		SenderID:  senderID,
 		Content:   req.Content,
 		Timestamp: time.Now(),
-		Status:    models.StatusSent, // Initial status
+		Status:    models.StatusSent,
 	}
 
 	err = h.messageStore.CreateMessage(c.Request.Context(), message)
@@ -114,20 +104,26 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 		return
 	}
 
-	// Populate sender details for the response
+	// Populate sender details for the response and WebSocket broadcast
 	senderUser, err := h.userStore.GetUserByID(c.Request.Context(), senderID.String())
 	if err == nil && senderUser != nil {
 		message.Sender = senderUser.ToPublicUser()
 	} else {
 		log.Printf("PostMessage: Could not fetch sender details for user %s: %v", senderID, err)
-		// Continue without sender details if it fails, or handle error differently
+		// Create a minimal sender if lookup fails
+		message.Sender = &models.PublicUser{ID: senderID, Username: "Unknown User"}
 	}
 
-	// TODO: Broadcast message via WebSocket to other participant(s) in the chat
-	// if h.wsHub != nil && chat != nil {
-	//     // Determine recipients from 'chat' or by fetching participants of chatID
-	//     // h.wsHub.BroadcastMessageToChat(chatID, message, senderID)
-	// }
+	// Broadcast the newly created message via WebSocket Hub
+	if h.wsHub != nil {
+		// If a new chat was created, we might need to inform participants about it too.
+		// For now, just broadcast the message.
+		// The Hub's BroadcastChatMessage method will handle finding recipients.
+		log.Printf("PostMessage: Attempting to broadcast message %s via WebSocket Hub", message.ID)
+		h.wsHub.BroadcastChatMessage(message, createdChat) // Pass createdChat if it's new
+	} else {
+		log.Println("PostMessage: WebSocket Hub is nil, skipping broadcast.")
+	}
 
 	c.JSON(http.StatusCreated, message)
 }
@@ -146,21 +142,17 @@ func (h *RestHandler) GetMessagesByChatID(c *gin.Context) {
 		return
 	}
 
-	// Pagination parameters
-	limitStr := c.DefaultQuery("limit", "20")  // Default limit 20
-	offsetStr := c.DefaultQuery("offset", "0") // Default offset 0
+	limitStr := c.DefaultQuery("limit", "20")
+	offsetStr := c.DefaultQuery("offset", "0")
 
 	limit, err := strconv.Atoi(limitStr)
-	if err != nil || limit <= 0 || limit > 100 { // Max limit 100
+	if err != nil || limit <= 0 || limit > 100 {
 		limit = 20
 	}
 	offset, err := strconv.Atoi(offsetStr)
 	if err != nil || offset < 0 {
 		offset = 0
 	}
-
-	// Optional: Validate if the requesting user is part of this chatID (security)
-	// This would involve fetching chat participants for chatID and checking if current user is among them.
 
 	messages, err := h.messageStore.GetMessagesByChatID(c.Request.Context(), chatID, limit, offset)
 	if err != nil {
@@ -169,17 +161,16 @@ func (h *RestHandler) GetMessagesByChatID(c *gin.Context) {
 		return
 	}
 
-	if messages == nil { // Ensure we always return an array, even if empty
+	if messages == nil {
 		messages = make([]*models.Message, 0)
 	}
-
 	c.JSON(http.StatusOK, messages)
 }
 
 // GetChats handles requests to list all conversations for the authenticated user.
 // GET /chats?limit=<int>&offset=<int>
 func (h *RestHandler) GetChats(c *gin.Context) {
-	userIDString, _ := c.Get("userID") // From AuthMiddleware
+	userIDString, _ := c.Get("userID")
 	userID, err := uuid.Parse(userIDString.(string))
 	if err != nil {
 		log.Printf("GetChats: Invalid userID from token: %v", err)
@@ -187,12 +178,10 @@ func (h *RestHandler) GetChats(c *gin.Context) {
 		return
 	}
 
-	// Pagination parameters
 	limitStr := c.DefaultQuery("limit", "20")
 	offsetStr := c.DefaultQuery("offset", "0")
-
 	limit, err := strconv.Atoi(limitStr)
-	if err != nil || limit <= 0 || limit > 50 { // Max limit 50 for chat list
+	if err != nil || limit <= 0 || limit > 50 {
 		limit = 20
 	}
 	offset, err := strconv.Atoi(offsetStr)
@@ -200,9 +189,6 @@ func (h *RestHandler) GetChats(c *gin.Context) {
 		offset = 0
 	}
 
-	// The store method GetUserChats needs to be fully implemented to populate
-	// OtherParticipants, LastMessage, and UnreadCount.
-	// This is a complex query.
 	chats, err := h.chatStore.GetUserChats(c.Request.Context(), userID, limit, offset)
 	if err != nil {
 		log.Printf("GetChats: Failed to get chats for user %s: %v", userID, err)
@@ -210,13 +196,8 @@ func (h *RestHandler) GetChats(c *gin.Context) {
 		return
 	}
 
-	if chats == nil { // Ensure we always return an array
+	if chats == nil {
 		chats = make([]*models.Chat, 0)
 	}
-
-	// For each chat, we need to populate OtherParticipants and LastMessage if not done by store
-	// The current GetUserChats in store is a placeholder. A full implementation would do this.
-	// For now, this will likely return chats with these fields empty.
-
 	c.JSON(http.StatusOK, chats)
 }
