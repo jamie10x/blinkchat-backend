@@ -1,0 +1,14 @@
+# Environment variables
+.env
+
+# Compiled binary (if you build locally outside Docker)
+/go-chat-backend # Or whatever your binary name might be if you build it to the root
+cmd/server/server # If you build it inside cmd/server and name it 'server'
+
+# IDE-specific files
+.idea/
+*.iml
+
+# OS-specific files
+.DS_Store
+http-client.private.env.json

@@ -1,0 +1,269 @@
+### Health Check
+GET http://localhost:8080/health
+Accept: application/json
+
+### Register New User A (Dynamic & Automated)
+POST http://localhost:8080/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "username": "userA_{{$random.alphabetic(5)}}",
+  "email": "userA_{{$random.uuid}}@example.com",
+  "password": "passwordA"
+}
+> {%
+    if (response.status === 201) {
+        client.global.set("userAEmail", response.body.user.email);
+        client.global.set("userAPassword", "passwordA");
+        client.global.set("userAID", response.body.user.id);
+        console.log("Registered User A:", response.body.user.email, "ID:", response.body.user.id);
+    } else {
+        console.error("Registration failed for User A:", response.status, response.body);
+    }
+%}
+
+### Login User A (Automated)
+POST http://localhost:8080/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{userAEmail}}",
+  "password": "{{userAPassword}}"
+}
+> {%
+    if (response.status === 200) {
+        client.global.set("tokenA", response.body.token);
+        console.log("Logged in User A, token stored.");
+    } else {
+        console.error("Login failed for User A:", response.status, response.body);
+    }
+%}
+
+### Register New User B (Dynamic & Automated)
+POST http://localhost:8080/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "username": "userB_{{$random.alphabetic(5)}}",
+  "email": "userB_{{$random.uuid}}@example.com",
+  "password": "passwordB"
+}
+> {%
+    if (response.status === 201) {
+        client.global.set("userBEmail", response.body.user.email);
+        client.global.set("userBPassword", "passwordB");
+        client.global.set("userBID", response.body.user.id);
+        console.log("Registered User B:", response.body.user.email, "ID:", response.body.user.id);
+    } else {
+        console.error("Registration failed for User B:", response.status, response.body);
+    }
+%}
+
+### Login User B (Automated)
+POST http://localhost:8080/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{userBEmail}}",
+  "password": "{{userBPassword}}"
+}
+> {%
+    if (response.status === 200) {
+        client.global.set("tokenB", response.body.token);
+        console.log("Logged in User B, token stored.");
+    } else {
+        console.error("Login failed for User B:", response.status, response.body);
+    }
+%}
+
+### Test /api/v1/messages - User A sends first message to User B (New Chat) (Automated)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+Authorization: Bearer {{tokenA}}
+
+{
+    "receiverId": "{{userBID}}",
+    "content": "Hello User B, this is User A!"
+}
+> {%
+    if (response.status === 201) {
+        client.global.set("chatId", response.body.chatId);
+        console.log("Message sent, new chat ID:", response.body.chatId);
+    } else {
+        console.error("Sending first message failed:", response.status, response.body);
+    }
+%}
+
+### Test /api/v1/messages - User B replies in existing chat (Automated)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+Authorization: Bearer {{tokenB}}
+
+{
+    "chatId": "{{chatId}}",
+    "content": "Hi User A, User B here!"
+}
+> {%
+    if (response.status === 201) {
+        console.log("User B replied in chat:", client.global.get("chatId"));
+    } else {
+        console.error("User B reply failed:", response.status, response.body);
+    }
+%}
+
+### Test /api/v1/messages - Get messages by chat ID (Automated)
+GET http://localhost:8080/api/v1/messages?chatId={{chatId}}&limit=10
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+
+### Test /api/v1/chats - Get User A's chats (Automated)
+GET http://localhost:8080/api/v1/chats?limit=10
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+
+### Test /api/v1/auth/me - With Valid Token (Automated - General Auth Test)
+GET http://localhost:8080/api/v1/auth/me
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+
+### Test /api/v1/users/:id - Get User by ID (Automated - General User Test)
+GET http://localhost:8080/api/v1/users/{{userAID}}
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+
+### Test /api/v1/users?search - Search User by Email (Automated - General User Test)
+GET http://localhost:8080/api/v1/users?search={{userAEmail}}
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+
+### Register Existing User (Email Conflict - Manual Test)
+POST http://localhost:8080/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "username": "another_user_manual",
+  "email": "test_1@example.com",
+  "password": "password123"
+}
+
+### Register Existing User (Username Conflict - Manual Test)
+POST http://localhost:8080/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "username": "testuser_1",
+  "email": "test_2@example.com",
+  "password": "password123"
+}
+
+### Login User with Wrong Password (Manual Test)
+POST http://localhost:8080/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "test_1@example.com",
+  "password": "wrongpassword"
+}
+
+### Login Non-Existent User (Manual Test)
+POST http://localhost:8080/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "nonexistent@example.com",
+  "password": "somepassword"
+}
+
+### Test /api/v1/auth/me - No Authorization Header (Manual Test)
+GET http://localhost:8080/api/v1/auth/me
+Accept: application/json
+
+### Test /api/v1/auth/me - Invalid Token (Manual Test)
+GET http://localhost:8080/api/v1/auth/me
+Accept: application/json
+Authorization: Bearer aninvalidtokenstring
+
+### Test /api/v1/users/:id - Invalid UUID Format (Manual Test)
+GET http://localhost:8080/api/v1/users/not-a-uuid
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+# Requires a valid token from a prior successful login for this test.
+
+### Test /api/v1/users/:id - Non-Existent Valid UUID (Manual Test)
+GET http://localhost:8080/api/v1/users/00000000-0000-0000-0000-000000000000
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+# Requires a valid token from a prior successful login for this test.
+
+### Test /api/v1/users?search - No Search Query (Manual Test)
+GET http://localhost:8080/api/v1/users
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+# Requires a valid token from a prior successful login for this test.
+
+### Test /api/v1/users - No Authorization Header (Manual Test for Users Endpoint)
+GET http://localhost:8080/api/v1/users/{{userAID}}
+Accept: application/json
+
+### Test /api/v1/users?search - No Authorization Header (Manual Test for Users Endpoint)
+GET http://localhost:8080/api/v1/users?search=someuser@example.com
+Accept: application/json
+
+### Test /api/v1/messages - Missing receiverId/chatId (Manual Test)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+Authorization: Bearer {{tokenA}}
+{
+    "content": "This message has no recipient!"
+}
+
+# Expected: 400 Bad Request
+
+### Test /api/v1/messages - Invalid receiverId UUID (Manual Test)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+Authorization: Bearer {{tokenA}}
+{
+    "receiverId": "not-a-uuid",
+    "content": "This message has an invalid receiver ID!"
+}
+# Expected: 400 Bad Request
+
+### Test /api/v1/messages - Non-existent receiverId (Manual Test)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+Authorization: Bearer {{tokenA}}
+{
+    "receiverId": "00000000-0000-0000-0000-000000000000",
+    "content": "Sending to a non-existent user!"
+}
+# Expected: 404 Not Found (if your handler checks for receiver existence)
+
+### Test /api/v1/messages - Missing content (Manual Test)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+Authorization: Bearer {{tokenA}}
+{
+    "receiverId": "{{userBID}}"
+}
+# Expected: 400 Bad Request
+
+### Test /api/v1/messages - Non-existent chatId (Manual Test)
+GET http://localhost:8080/api/v1/messages?chatId=00000000-0000-0000-0000-000000000000&limit=10
+Accept: application/json
+Authorization: Bearer {{tokenA}}
+# Expected: 200 OK with empty array [] or 404 Not Found (depending on your specific handler logic)
+
+### Test /api/v1/messages - No Authorization Header (Manual Test for Messages Endpoint)
+POST http://localhost:8080/api/v1/messages
+Content-Type: application/json
+{
+    "receiverId": "some-uuid",
+    "content": "This message has no authorization!"
+}
+# Expected: 401 Unauthorized
+
+### Test /api/v1/chats - No Authorization Header (Manual Test for Chats Endpoint)
+GET http://localhost:8080/api/v1/chats?limit=10
+Accept: application/json
+# Expected: 401 Unauthorized
