@@ -3,19 +3,19 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json" // For unmarshalling JSONB from database
+	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
-	"blinkchat-backend/internal/models" // USE YOUR ACTUAL MODULE PATH
+	"blinkchat-backend/internal/models"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// ChatStore defines the interface for chat data operations.
+// ChatStore defines persistence operations for chats and participants.
 type ChatStore interface {
 	CreateChat(ctx context.Context, participantIDs []uuid.UUID) (*models.Chat, error)
 	GetChatByID(ctx context.Context, chatID uuid.UUID) (*models.Chat, error)
@@ -26,19 +26,17 @@ type ChatStore interface {
 	GetAllParticipantsInChat(ctx context.Context, chatID uuid.UUID) ([]*models.PublicUser, error)
 }
 
-// PostgresChatStore implements the ChatStore interface using PostgreSQL.
+// PostgresChatStore implements ChatStore with PostgreSQL.
 type PostgresChatStore struct {
 	db *pgxpool.Pool
 }
 
-// NewPostgresChatStore creates a new PostgresChatStore.
 func NewPostgresChatStore(db *pgxpool.Pool) *PostgresChatStore {
 	return &PostgresChatStore{
 		db: db,
 	}
 }
 
-// CreateChat implementation (same as before)
 func (s *PostgresChatStore) CreateChat(ctx context.Context, participantIDs []uuid.UUID) (*models.Chat, error) {
 	if len(participantIDs) == 0 {
 		return nil, fmt.Errorf("at least one participant is required to create a chat")
@@ -69,7 +67,6 @@ func (s *PostgresChatStore) CreateChat(ctx context.Context, participantIDs []uui
 	return createdChat, nil
 }
 
-// getChatParticipantsInternal helper (same as before)
 func (s *PostgresChatStore) getChatParticipantsInternal(ctx context.Context, chatID uuid.UUID) ([]*models.PublicUser, error) {
 	query := `
         SELECT u.id, u.username, u.email, u.created_at, u.updated_at
@@ -97,12 +94,10 @@ func (s *PostgresChatStore) getChatParticipantsInternal(ctx context.Context, cha
 	return participants, nil
 }
 
-// GetAllParticipantsInChat implementation (same as before)
 func (s *PostgresChatStore) GetAllParticipantsInChat(ctx context.Context, chatID uuid.UUID) ([]*models.PublicUser, error) {
 	return s.getChatParticipantsInternal(ctx, chatID)
 }
 
-// GetChatByID implementation (same as before, uses GetAllParticipantsInChat)
 func (s *PostgresChatStore) GetChatByID(ctx context.Context, chatID uuid.UUID) (*models.Chat, error) {
 	query := `SELECT id, created_at FROM chats WHERE id = $1`
 	chat := &models.Chat{}
@@ -122,7 +117,6 @@ func (s *PostgresChatStore) GetChatByID(ctx context.Context, chatID uuid.UUID) (
 	return chat, nil
 }
 
-// GetChatByParticipantIDs implementation (same as before)
 func (s *PostgresChatStore) GetChatByParticipantIDs(ctx context.Context, participantIDs []uuid.UUID) (*models.Chat, error) {
 	if len(participantIDs) != 2 {
 		return nil, fmt.Errorf("GetChatByParticipantIDs expects exactly two participant IDs for 1:1 chat lookup")
@@ -152,34 +146,29 @@ func (s *PostgresChatStore) GetChatByParticipantIDs(ctx context.Context, partici
 	return chat, nil
 }
 
-// GetUserChats implementation (REVISED SQL and Go processing)
 func (s *PostgresChatStore) GetUserChats(ctx context.Context, userID uuid.UUID, limit, offset int) ([]*models.Chat, error) {
 	query := `
 WITH user_chat_ids AS (
-    -- Find all chat IDs the current user is a participant in
     SELECT cp.chat_id
     FROM chat_participants cp
     WHERE cp.user_id = $1
 ),
 chat_participant_details AS (
-    -- Get public details of all users who are participants in the user_chat_ids,
-    -- excluding the current user.
     SELECT
         cp.chat_id,
         jsonb_agg(jsonb_build_object(
             'id', u.id,
             'username', u.username,
-            'email', u.email, -- Consider if email should be in chat list for other participants
+            'email', u.email,
             'createdAt', u.created_at,
             'updatedAt', u.updated_at
-        )) FILTER (WHERE u.id != $1) AS other_participants_json -- Filter out current user
+        )) FILTER (WHERE u.id != $1) AS other_participants_json
     FROM chat_participants cp
     JOIN users u ON cp.user_id = u.id
     WHERE cp.chat_id IN (SELECT uci.chat_id FROM user_chat_ids uci)
     GROUP BY cp.chat_id
 ),
 ranked_messages AS (
-    -- Rank messages within each chat to find the latest one
     SELECT
         m.id AS message_id,
         m.chat_id,
@@ -189,7 +178,7 @@ ranked_messages AS (
         m.created_at AS message_timestamp,
         u_sender.id AS sender_user_id,
         u_sender.username AS sender_username,
-        u_sender.email AS sender_email, -- For sender of last message
+        u_sender.email AS sender_email,
         u_sender.created_at AS sender_user_created_at,
         u_sender.updated_at AS sender_user_updated_at,
         ROW_NUMBER() OVER (PARTITION BY m.chat_id ORDER BY m.created_at DESC) as rn
@@ -198,16 +187,14 @@ ranked_messages AS (
     WHERE m.chat_id IN (SELECT uci.chat_id FROM user_chat_ids uci)
 ),
 last_messages AS (
-    -- Select only the latest message for each chat
     SELECT *
     FROM ranked_messages
     WHERE rn = 1
 )
--- Final selection joining chat info, other participants (as JSON), and last message
 SELECT
     c.id AS chat_id,
     c.created_at AS chat_created_at,
-    cpd.other_participants_json, -- This will be a JSONB array string
+    cpd.other_participants_json,
     lm.message_id,
     lm.content AS last_message_content,
     lm.message_timestamp AS last_message_timestamp,
@@ -237,7 +224,7 @@ LIMIT $2 OFFSET $3;
 	for rows.Next() {
 		var chatID uuid.UUID
 		var chatCreatedAt time.Time
-		var otherParticipantsJSONBytes []byte // To scan the JSONB array
+		var otherParticipantsJSONBytes []byte
 		var lastMessageID sql.NullString
 		var lastMessageContent sql.NullString
 		var lastMessageTimestamp sql.NullTime
@@ -272,19 +259,15 @@ LIMIT $2 OFFSET $3;
 			CreatedAt: chatCreatedAt,
 		}
 
-		// Unmarshal other participants JSON
 		if otherParticipantsJSONBytes != nil {
 			var participants []*models.PublicUser
 			if err := json.Unmarshal(otherParticipantsJSONBytes, &participants); err != nil {
 				log.Printf("Error unmarshalling other_participants_json for chat %s: %v", chatID, err)
-				// Continue, chat.OtherParticipants will be nil or empty
 				chat.OtherParticipants = []*models.PublicUser{}
 			} else {
 				chat.OtherParticipants = participants
 			}
 		} else {
-			// Handle case where there might be no "other" participants if it's a chat with self (should not happen)
-			// or if the jsonb_agg resulted in NULL (e.g. chat has only the current user, which is filtered out)
 			chat.OtherParticipants = []*models.PublicUser{}
 		}
 
@@ -315,7 +298,7 @@ LIMIT $2 OFFSET $3;
 			}
 		}
 
-		chat.UnreadCount = 0 // Placeholder for unread count
+		chat.UnreadCount = 0
 		chatsSlice = append(chatsSlice, chat)
 	}
 	if err = rows.Err(); err != nil {
@@ -326,15 +309,9 @@ LIMIT $2 OFFSET $3;
 	return chatsSlice, nil
 }
 
-// getOtherChatParticipants (helper for GetUserChats - can be removed if above works or kept for other uses)
 func (s *PostgresChatStore) getOtherChatParticipants(ctx context.Context, chatID uuid.UUID, currentUserID uuid.UUID) ([]*models.PublicUser, error) {
-	// ... (implementation was here, now handled by jsonb_agg in GetUserChats)
-	// This specific helper might not be needed if GetUserChats handles it all via SQL.
-	// However, keeping it if other parts of the store might need it.
-	// For now, it's effectively replaced by the jsonb_agg in the main GetUserChats query.
-	// If you confirm the jsonb_agg approach is stable, this helper can be removed or refactored.
 	log.Printf("getOtherChatParticipants called for chat %s, user %s - this might be redundant now", chatID, currentUserID)
-	return s.getChatParticipantsInternal(ctx, chatID) // Re-using the internal helper for now
+	return s.getChatParticipantsInternal(ctx, chatID)
 }
 
 func (s *PostgresChatStore) AddUserToChat(ctx context.Context, chatID uuid.UUID, userID uuid.UUID) error {
@@ -355,7 +332,6 @@ func (s *PostgresChatStore) RemoveUserFromChat(ctx context.Context, chatID uuid.
 	return nil
 }
 
-// --- Custom Errors for ChatStore ---
 var (
 	ErrChatNotFound = fmt.Errorf("chat not found")
 )
