@@ -8,13 +8,13 @@ import (
 	"sync"
 	"time"
 
-	"blinkchat-backend/internal/models" // USE YOUR ACTUAL MODULE PATH
+	"blinkchat-backend/internal/models"
 	"blinkchat-backend/internal/store"
 
 	"github.com/google/uuid"
 )
 
-// Hub maintains the set of active clients and broadcasts messages to the clients.
+// Hub maintains active WebSocket clients and broadcasts messages.
 type Hub struct {
 	clients    map[uuid.UUID]map[*Client]bool
 	clientsMux sync.RWMutex
@@ -28,7 +28,7 @@ type Hub struct {
 	messageStore store.MessageStore
 }
 
-// NewHub creates a new Hub instance.
+// NewHub returns a Hub wired to the provided stores.
 func NewHub(us store.UserStore, cs store.ChatStore, ms store.MessageStore) *Hub {
 	return &Hub{
 		clients:        make(map[uuid.UUID]map[*Client]bool),
@@ -41,7 +41,7 @@ func NewHub(us store.UserStore, cs store.ChatStore, ms store.MessageStore) *Hub 
 	}
 }
 
-// Run starts the Hub's main event loop.
+// Run processes hub events until the process exits.
 func (h *Hub) Run() {
 	log.Println("WebSocket Hub: Starting...")
 	for {
@@ -128,27 +128,27 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 	var createdChat *models.Chat
 	var targetUserIDs []uuid.UUID
 
-	if payload.ChatID != nil { // Client knows the chat
+	if payload.ChatID != nil {
 		chatID = *payload.ChatID
-		allParticipants, err := h.chatStore.GetAllParticipantsInChat(ctx, chatID) // Fetch all
+		allParticipants, err := h.chatStore.GetAllParticipantsInChat(ctx, chatID)
 		if err != nil {
 			log.Printf("WS Hub (NewMsgViaWS): Error fetching participants for chat %s: %v", chatID, err)
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Error processing message details"})
 			return
 		}
 		for _, p := range allParticipants {
-			if p.ID != senderClient.userID { // Target is everyone else in that chat
+			if p.ID != senderClient.userID {
 				targetUserIDs = append(targetUserIDs, p.ID)
 			}
 		}
-	} else if payload.ReceiverID != nil { // Client initiating with a specific user
+	} else if payload.ReceiverID != nil {
 		receiverID := *payload.ReceiverID
 		if senderClient.userID == receiverID {
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Cannot send message to yourself"})
 			return
 		}
 		participantIDs := []uuid.UUID{senderClient.userID, receiverID}
-		existingChat, err := h.chatStore.GetChatByParticipantIDs(ctx, participantIDs) // Checks for 1:1 chat
+		existingChat, err := h.chatStore.GetChatByParticipantIDs(ctx, participantIDs)
 		if err != nil && !errors.Is(err, store.ErrChatNotFound) {
 			log.Printf("WS Hub (NewMsgViaWS): Error finding chat: %v", err)
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Error processing message"})
@@ -157,22 +157,21 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 		if existingChat != nil {
 			chatID = existingChat.ID
 		} else {
-			newChat, CCErr := h.chatStore.CreateChat(ctx, participantIDs)
-			if CCErr != nil {
-				log.Printf("WS Hub (NewMsgViaWS): Error creating chat: %v", CCErr)
+			newChat, createErr := h.chatStore.CreateChat(ctx, participantIDs)
+			if createErr != nil {
+				log.Printf("WS Hub (NewMsgViaWS): Error creating chat: %v", createErr)
 				senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Error creating chat for message"})
 				return
 			}
 			chatID = newChat.ID
 			createdChat = newChat
 		}
-		targetUserIDs = append(targetUserIDs, receiverID) // The direct recipient
+		targetUserIDs = append(targetUserIDs, receiverID)
 	} else {
 		senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "New message requires chatId or receiverId"})
 		return
 	}
 
-	// Create and Save Message to DB
 	dbMessage := &models.Message{
 		ID:        uuid.New(),
 		ChatID:    chatID,
@@ -187,16 +186,14 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 		return
 	}
 
-	// Populate Sender for broadcast message
 	senderUser, err := h.userStore.GetUserByID(ctx, senderClient.userID.String())
 	if err == nil && senderUser != nil {
 		dbMessage.Sender = senderUser.ToPublicUser()
 	} else {
 		log.Printf("WS Hub (NewMsgViaWS): Could not fetch sender details for user %s: %v", senderClient.userID, err)
-		dbMessage.Sender = &models.PublicUser{ID: senderClient.userID, Username: "Unknown"} // Fallback
+		dbMessage.Sender = &models.PublicUser{ID: senderClient.userID, Username: "Unknown"}
 	}
 
-	// Send Acknowledgement back to Sender
 	ackPayload := MessageSentAckPayload{
 		ClientTempID: payload.ClientTempID,
 		ServerMsgID:  dbMessage.ID,
@@ -206,16 +203,16 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 	}
 	senderClient.SendMessage(MessageTypeMessageSentAck, ackPayload)
 
-	// Broadcast the message using the common broadcast logic
 	h.broadcastMessageToTargets(dbMessage, targetUserIDs, createdChat)
 }
 
+// BroadcastChatMessage broadcasts a stored message to connected recipients.
 func (h *Hub) BroadcastChatMessage(message *models.Message, initialChat *models.Chat) {
 	log.Printf("Hub: Received message %s for chat %s to broadcast (Sender: %s)", message.ID, message.ChatID, message.SenderID)
 	ctx := context.Background()
 	var targetUserIDs []uuid.UUID
 
-	allParticipantsInChat, err := h.chatStore.GetAllParticipantsInChat(ctx, message.ChatID) // USE NEW STORE METHOD
+	allParticipantsInChat, err := h.chatStore.GetAllParticipantsInChat(ctx, message.ChatID)
 	if err != nil {
 		log.Printf("Hub (BroadcastChatMessage): Error fetching participants for chat %s: %v", message.ChatID, err)
 		return
@@ -242,7 +239,6 @@ func (h *Hub) broadcastMessageToTargets(message *models.Message, targetUserIDs [
 			}
 		} else {
 			log.Printf("Hub: Recipient %s for chat %s is not connected for message %s.", targetUserID, message.ChatID, message.ID)
-			// TODO: Trigger Push Notification if user is offline
 		}
 	}
 }
@@ -267,14 +263,13 @@ func (h *Hub) handleMessageStatusUpdate(ctx context.Context, senderClient *Clien
 		MessageID: payload.MessageID,
 		ChatID:    payload.ChatID,
 		Status:    payload.Status,
-		UserID:    senderClient.userID, // User whose client triggered this status change
+		UserID:    senderClient.userID,
 		Timestamp: models.JSONTime(time.Now()),
 	}
 
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()
 
-	// Notify the original sender
 	if originalMessage.SenderID != senderClient.userID {
 		if senderUserClients, found := h.clients[originalMessage.SenderID]; found {
 			for clientInstance := range senderUserClients {
@@ -282,10 +277,8 @@ func (h *Hub) handleMessageStatusUpdate(ctx context.Context, senderClient *Clien
 			}
 		}
 	}
-	// Notify other connected devices of the user who triggered status update
 	if recipientUserClients, found := h.clients[senderClient.userID]; found {
 		for clientInstance := range recipientUserClients {
-			// if clientInstance == senderClient { continue } // We might want to send to all, including originating
 			clientInstance.SendMessage(MessageTypeMessageStatusUpdate, broadcastPayload)
 		}
 	}
@@ -295,7 +288,6 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 	log.Printf("WebSocket Hub (Typing): User %s in chat %s isTyping: %v",
 		payload.UserID, payload.ChatID, payload.IsTyping)
 
-	// Validate sender
 	if payload.UserID != senderClient.userID {
 		log.Printf("WS Hub (Typing): Mismatched UserID in payload (%s) and client session (%s)", payload.UserID, senderClient.userID)
 		senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Typing indicator user ID mismatch"})
@@ -311,7 +303,7 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 
 	var targetUserIDs []uuid.UUID
 	for _, p := range allParticipants {
-		if p.ID != senderClient.userID { // Don't send to self
+		if p.ID != senderClient.userID {
 			targetUserIDs = append(targetUserIDs, p.ID)
 		}
 	}
@@ -320,7 +312,6 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 	for _, targetUserID := range targetUserIDs {
 		if userClients, found := h.clients[targetUserID]; found {
 			for clientInstance := range userClients {
-				// Send the original payload as received from the client
 				clientInstance.SendMessage(MessageTypeTypingIndicator, payload)
 			}
 		}
@@ -328,6 +319,7 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 	h.clientsMux.RUnlock()
 }
 
+// BroadcastToUser sends a message to all connected clients for a user.
 func (h *Hub) BroadcastToUser(userID uuid.UUID, msgType string, payload interface{}) {
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()

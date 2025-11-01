@@ -7,9 +7,9 @@ import (
 	"strconv"
 	"time"
 
-	"blinkchat-backend/internal/models"    // Use your actual module path
-	"blinkchat-backend/internal/store"     // Use your actual module path
-	"blinkchat-backend/internal/websocket" // Use your actual module path
+	"blinkchat-backend/internal/models"
+	"blinkchat-backend/internal/store"
+	"blinkchat-backend/internal/websocket"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -20,21 +20,18 @@ type RestHandler struct {
 	chatStore    store.ChatStore
 	messageStore store.MessageStore
 	userStore    store.UserStore
-	wsHub        *websocket.Hub // Added WebSocket Hub
+	wsHub        *websocket.Hub
 }
 
-// NewRestHandler creates a new RestHandler.
 func NewRestHandler(cs store.ChatStore, ms store.MessageStore, us store.UserStore, hub *websocket.Hub) *RestHandler {
 	return &RestHandler{
 		chatStore:    cs,
 		messageStore: ms,
 		userStore:    us,
-		wsHub:        hub, // Store the Hub
+		wsHub:        hub,
 	}
 }
 
-// PostMessage handles requests to send a new message.
-// POST /messages
 func (h *RestHandler) PostMessage(c *gin.Context) {
 	var req models.CreateMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -42,7 +39,7 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 		return
 	}
 
-	senderIDString, _ := c.Get("userID") // From AuthMiddleware
+	senderIDString, _ := c.Get("userID")
 	senderID, err := uuid.Parse(senderIDString.(string))
 	if err != nil {
 		log.Printf("PostMessage: Invalid senderID from token: %v", err)
@@ -51,7 +48,7 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 	}
 
 	var chatID uuid.UUID
-	var createdChat *models.Chat // To hold newly created chat if any
+	var createdChat *models.Chat
 
 	if req.ChatID != nil {
 		chatID = *req.ChatID
@@ -80,14 +77,13 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 				return
 			}
 			chatID = newChat.ID
-			createdChat = newChat // Store the newly created chat
+			createdChat = newChat
 		}
 	} else {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Either chatId or receiverId must be provided"})
 		return
 	}
 
-	// Create the message model
 	message := &models.Message{
 		ID:        uuid.New(),
 		ChatID:    chatID,
@@ -104,23 +100,17 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 		return
 	}
 
-	// Populate sender details for the response and WebSocket broadcast
 	senderUser, err := h.userStore.GetUserByID(c.Request.Context(), senderID.String())
 	if err == nil && senderUser != nil {
 		message.Sender = senderUser.ToPublicUser()
 	} else {
 		log.Printf("PostMessage: Could not fetch sender details for user %s: %v", senderID, err)
-		// Create a minimal sender if lookup fails
 		message.Sender = &models.PublicUser{ID: senderID, Username: "Unknown User"}
 	}
 
-	// Broadcast the newly created message via WebSocket Hub
 	if h.wsHub != nil {
-		// If a new chat was created, we might need to inform participants about it too.
-		// For now, just broadcast the message.
-		// The Hub's BroadcastChatMessage method will handle finding recipients.
 		log.Printf("PostMessage: Attempting to broadcast message %s via WebSocket Hub", message.ID)
-		h.wsHub.BroadcastChatMessage(message, createdChat) // Pass createdChat if it's new
+		h.wsHub.BroadcastChatMessage(message, createdChat)
 	} else {
 		log.Println("PostMessage: WebSocket Hub is nil, skipping broadcast.")
 	}
@@ -128,8 +118,6 @@ func (h *RestHandler) PostMessage(c *gin.Context) {
 	c.JSON(http.StatusCreated, message)
 }
 
-// GetMessagesByChatID handles requests to retrieve messages for a specific chat.
-// GET /messages?chatId=<uuid>&limit=<int>&offset=<int>
 func (h *RestHandler) GetMessagesByChatID(c *gin.Context) {
 	chatIDStr := c.Query("chatId")
 	if chatIDStr == "" {
@@ -167,8 +155,6 @@ func (h *RestHandler) GetMessagesByChatID(c *gin.Context) {
 	c.JSON(http.StatusOK, messages)
 }
 
-// GetChats handles requests to list all conversations for the authenticated user.
-// GET /chats?limit=<int>&offset=<int>
 func (h *RestHandler) GetChats(c *gin.Context) {
 	userIDString, _ := c.Get("userID")
 	userID, err := uuid.Parse(userIDString.(string))
