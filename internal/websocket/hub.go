@@ -5,16 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
-	"blinkchat-backend/internal/models" // USE YOUR ACTUAL MODULE PATH
+	"blinkchat-backend/internal/models"
 	"blinkchat-backend/internal/store"
 
 	"github.com/google/uuid"
 )
 
-// Hub maintains the set of active clients and broadcasts messages to the clients.
+// Hub maintains active WebSocket clients and broadcasts messages.
 type Hub struct {
 	clients    map[uuid.UUID]map[*Client]bool
 	clientsMux sync.RWMutex
@@ -28,7 +29,7 @@ type Hub struct {
 	messageStore store.MessageStore
 }
 
-// NewHub creates a new Hub instance.
+// NewHub returns a Hub wired to the provided stores.
 func NewHub(us store.UserStore, cs store.ChatStore, ms store.MessageStore) *Hub {
 	return &Hub{
 		clients:        make(map[uuid.UUID]map[*Client]bool),
@@ -41,7 +42,7 @@ func NewHub(us store.UserStore, cs store.ChatStore, ms store.MessageStore) *Hub 
 	}
 }
 
-// Run starts the Hub's main event loop.
+// Run processes hub events until the process exits.
 func (h *Hub) Run() {
 	log.Println("WebSocket Hub: Starting...")
 	for {
@@ -95,6 +96,10 @@ func (h *Hub) handleIncomingMessage(senderClient *Client, rawJSON []byte) {
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Invalid new_message payload"})
 			return
 		}
+		if strings.TrimSpace(payload.Content) == "" && payload.AttachmentURL == nil {
+			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Message content or attachment required"})
+			return
+		}
 		h.handleNewChatMessageViaWS(ctx, senderClient, payload)
 
 	case MessageTypeMessageStatusUpdate:
@@ -128,27 +133,27 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 	var createdChat *models.Chat
 	var targetUserIDs []uuid.UUID
 
-	if payload.ChatID != nil { // Client knows the chat
+	if payload.ChatID != nil {
 		chatID = *payload.ChatID
-		allParticipants, err := h.chatStore.GetAllParticipantsInChat(ctx, chatID) // Fetch all
+		allParticipants, err := h.chatStore.GetAllParticipantsInChat(ctx, chatID)
 		if err != nil {
 			log.Printf("WS Hub (NewMsgViaWS): Error fetching participants for chat %s: %v", chatID, err)
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Error processing message details"})
 			return
 		}
 		for _, p := range allParticipants {
-			if p.ID != senderClient.userID { // Target is everyone else in that chat
+			if p.ID != senderClient.userID {
 				targetUserIDs = append(targetUserIDs, p.ID)
 			}
 		}
-	} else if payload.ReceiverID != nil { // Client initiating with a specific user
+	} else if payload.ReceiverID != nil {
 		receiverID := *payload.ReceiverID
 		if senderClient.userID == receiverID {
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Cannot send message to yourself"})
 			return
 		}
 		participantIDs := []uuid.UUID{senderClient.userID, receiverID}
-		existingChat, err := h.chatStore.GetChatByParticipantIDs(ctx, participantIDs) // Checks for 1:1 chat
+		existingChat, err := h.chatStore.GetChatByParticipantIDs(ctx, participantIDs)
 		if err != nil && !errors.Is(err, store.ErrChatNotFound) {
 			log.Printf("WS Hub (NewMsgViaWS): Error finding chat: %v", err)
 			senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Error processing message"})
@@ -157,29 +162,33 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 		if existingChat != nil {
 			chatID = existingChat.ID
 		} else {
-			newChat, CCErr := h.chatStore.CreateChat(ctx, participantIDs)
-			if CCErr != nil {
-				log.Printf("WS Hub (NewMsgViaWS): Error creating chat: %v", CCErr)
+			newChat, createErr := h.chatStore.CreateChat(ctx, "", false, participantIDs)
+			if createErr != nil {
+				log.Printf("WS Hub (NewMsgViaWS): Error creating chat: %v", createErr)
 				senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Error creating chat for message"})
 				return
 			}
 			chatID = newChat.ID
 			createdChat = newChat
 		}
-		targetUserIDs = append(targetUserIDs, receiverID) // The direct recipient
+		targetUserIDs = append(targetUserIDs, receiverID)
 	} else {
 		senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "New message requires chatId or receiverId"})
 		return
 	}
 
-	// Create and Save Message to DB
+	content := strings.TrimSpace(payload.Content)
 	dbMessage := &models.Message{
 		ID:        uuid.New(),
 		ChatID:    chatID,
 		SenderID:  senderClient.userID,
-		Content:   payload.Content,
+		Content:   content,
 		Timestamp: time.Now(),
 		Status:    models.StatusSent,
+	}
+	dbMessage.UpdatedAt = dbMessage.Timestamp
+	if payload.AttachmentURL != nil {
+		dbMessage.AttachmentURL = payload.AttachmentURL
 	}
 	if err := h.messageStore.CreateMessage(ctx, dbMessage); err != nil {
 		log.Printf("WS Hub (NewMsgViaWS): Error saving message to DB: %v", err)
@@ -187,35 +196,40 @@ func (h *Hub) handleNewChatMessageViaWS(ctx context.Context, senderClient *Clien
 		return
 	}
 
-	// Populate Sender for broadcast message
+	_ = h.chatStore.UpdateParticipantReadThrough(ctx, chatID, senderClient.userID, dbMessage.Timestamp)
+
 	senderUser, err := h.userStore.GetUserByID(ctx, senderClient.userID.String())
 	if err == nil && senderUser != nil {
 		dbMessage.Sender = senderUser.ToPublicUser()
 	} else {
 		log.Printf("WS Hub (NewMsgViaWS): Could not fetch sender details for user %s: %v", senderClient.userID, err)
-		dbMessage.Sender = &models.PublicUser{ID: senderClient.userID, Username: "Unknown"} // Fallback
+		dbMessage.Sender = &models.PublicUser{ID: senderClient.userID, Username: "Unknown"}
 	}
 
-	// Send Acknowledgement back to Sender
+	if createdChat != nil {
+		createdChat.LastMessage = dbMessage
+	}
+
 	ackPayload := MessageSentAckPayload{
-		ClientTempID: payload.ClientTempID,
-		ServerMsgID:  dbMessage.ID,
-		ChatID:       chatID,
-		Timestamp:    models.JSONTime(dbMessage.Timestamp),
-		Status:       dbMessage.Status,
+		ClientTempID:  payload.ClientTempID,
+		ServerMsgID:   dbMessage.ID,
+		ChatID:        chatID,
+		Timestamp:     models.JSONTime(dbMessage.Timestamp),
+		Status:        dbMessage.Status,
+		AttachmentURL: dbMessage.AttachmentURL,
 	}
 	senderClient.SendMessage(MessageTypeMessageSentAck, ackPayload)
 
-	// Broadcast the message using the common broadcast logic
 	h.broadcastMessageToTargets(dbMessage, targetUserIDs, createdChat)
 }
 
+// BroadcastChatMessage broadcasts a stored message to connected recipients.
 func (h *Hub) BroadcastChatMessage(message *models.Message, initialChat *models.Chat) {
 	log.Printf("Hub: Received message %s for chat %s to broadcast (Sender: %s)", message.ID, message.ChatID, message.SenderID)
 	ctx := context.Background()
 	var targetUserIDs []uuid.UUID
 
-	allParticipantsInChat, err := h.chatStore.GetAllParticipantsInChat(ctx, message.ChatID) // USE NEW STORE METHOD
+	allParticipantsInChat, err := h.chatStore.GetAllParticipantsInChat(ctx, message.ChatID)
 	if err != nil {
 		log.Printf("Hub (BroadcastChatMessage): Error fetching participants for chat %s: %v", message.ChatID, err)
 		return
@@ -231,6 +245,21 @@ func (h *Hub) BroadcastChatMessage(message *models.Message, initialChat *models.
 }
 
 func (h *Hub) broadcastMessageToTargets(message *models.Message, targetUserIDs []uuid.UUID, newChatInfo *models.Chat) {
+	if len(targetUserIDs) == 0 {
+		return
+	}
+
+	if newChatInfo != nil {
+		chatCopy := *newChatInfo
+		chatCopy.LastMessage = cloneMessage(message)
+		participants, err := h.chatStore.GetAllParticipantsInChat(context.Background(), message.ChatID)
+		if err != nil {
+			log.Printf("Hub: Failed to fetch participants for new chat broadcast %s: %v", message.ChatID, err)
+		} else {
+			h.BroadcastNewChat(&chatCopy, participants, message.SenderID, targetUserIDs...)
+		}
+	}
+
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()
 
@@ -238,11 +267,10 @@ func (h *Hub) broadcastMessageToTargets(message *models.Message, targetUserIDs [
 		if userClients, found := h.clients[targetUserID]; found {
 			log.Printf("Hub: Broadcasting message %s to user %s (chat %s)", message.ID, targetUserID, message.ChatID)
 			for clientInstance := range userClients {
-				clientInstance.SendMessage(MessageTypeNewMessage, message)
+				clientInstance.SendMessage(MessageTypeNewMessage, cloneMessage(message))
 			}
 		} else {
 			log.Printf("Hub: Recipient %s for chat %s is not connected for message %s.", targetUserID, message.ChatID, message.ID)
-			// TODO: Trigger Push Notification if user is offline
 		}
 	}
 }
@@ -267,14 +295,13 @@ func (h *Hub) handleMessageStatusUpdate(ctx context.Context, senderClient *Clien
 		MessageID: payload.MessageID,
 		ChatID:    payload.ChatID,
 		Status:    payload.Status,
-		UserID:    senderClient.userID, // User whose client triggered this status change
+		UserID:    senderClient.userID,
 		Timestamp: models.JSONTime(time.Now()),
 	}
 
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()
 
-	// Notify the original sender
 	if originalMessage.SenderID != senderClient.userID {
 		if senderUserClients, found := h.clients[originalMessage.SenderID]; found {
 			for clientInstance := range senderUserClients {
@@ -282,10 +309,8 @@ func (h *Hub) handleMessageStatusUpdate(ctx context.Context, senderClient *Clien
 			}
 		}
 	}
-	// Notify other connected devices of the user who triggered status update
 	if recipientUserClients, found := h.clients[senderClient.userID]; found {
 		for clientInstance := range recipientUserClients {
-			// if clientInstance == senderClient { continue } // We might want to send to all, including originating
 			clientInstance.SendMessage(MessageTypeMessageStatusUpdate, broadcastPayload)
 		}
 	}
@@ -295,7 +320,6 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 	log.Printf("WebSocket Hub (Typing): User %s in chat %s isTyping: %v",
 		payload.UserID, payload.ChatID, payload.IsTyping)
 
-	// Validate sender
 	if payload.UserID != senderClient.userID {
 		log.Printf("WS Hub (Typing): Mismatched UserID in payload (%s) and client session (%s)", payload.UserID, senderClient.userID)
 		senderClient.SendMessage(MessageTypeError, ErrorPayload{Message: "Typing indicator user ID mismatch"})
@@ -311,7 +335,7 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 
 	var targetUserIDs []uuid.UUID
 	for _, p := range allParticipants {
-		if p.ID != senderClient.userID { // Don't send to self
+		if p.ID != senderClient.userID {
 			targetUserIDs = append(targetUserIDs, p.ID)
 		}
 	}
@@ -320,7 +344,6 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 	for _, targetUserID := range targetUserIDs {
 		if userClients, found := h.clients[targetUserID]; found {
 			for clientInstance := range userClients {
-				// Send the original payload as received from the client
 				clientInstance.SendMessage(MessageTypeTypingIndicator, payload)
 			}
 		}
@@ -328,6 +351,7 @@ func (h *Hub) handleTypingIndicator(ctx context.Context, senderClient *Client, p
 	h.clientsMux.RUnlock()
 }
 
+// BroadcastToUser sends a message to all connected clients for a user.
 func (h *Hub) BroadcastToUser(userID uuid.UUID, msgType string, payload interface{}) {
 	h.clientsMux.RLock()
 	defer h.clientsMux.RUnlock()
@@ -336,4 +360,185 @@ func (h *Hub) BroadcastToUser(userID uuid.UUID, msgType string, payload interfac
 			client.SendMessage(msgType, payload)
 		}
 	}
+}
+
+// BroadcastNewChat notifies chat participants about a newly created chat or newly added membership.
+func (h *Hub) BroadcastNewChat(chat *models.Chat, participants []*models.PublicUser, initiator uuid.UUID, explicitTargets ...uuid.UUID) {
+	if chat == nil {
+		return
+	}
+
+	ctx := context.Background()
+	if participants == nil {
+		var err error
+		participants, err = h.chatStore.GetAllParticipantsInChat(ctx, chat.ID)
+		if err != nil {
+			log.Printf("BroadcastNewChat: failed to load participants for chat %s: %v", chat.ID, err)
+			return
+		}
+	}
+
+	targetSet := make(map[uuid.UUID]struct{})
+	if len(explicitTargets) > 0 {
+		for _, id := range explicitTargets {
+			if id != initiator {
+				targetSet[id] = struct{}{}
+			}
+		}
+	} else {
+		for _, participant := range participants {
+			if participant.ID != initiator {
+				targetSet[participant.ID] = struct{}{}
+			}
+		}
+	}
+
+	if len(targetSet) == 0 {
+		return
+	}
+
+	h.clientsMux.RLock()
+	defer h.clientsMux.RUnlock()
+
+	for targetID := range targetSet {
+		chatCopy := *chat
+		chatCopy.OtherParticipants = filterParticipantsForViewer(participants, targetID)
+		if chatCopy.LastMessage != nil {
+			chatCopy.LastMessage = cloneMessage(chatCopy.LastMessage)
+			if chatCopy.LastMessage.SenderID != targetID && chatCopy.UnreadCount == 0 {
+				chatCopy.UnreadCount = 1
+			}
+		}
+		payload := NewChatPayload{Chat: &chatCopy}
+		if userClients, found := h.clients[targetID]; found {
+			for client := range userClients {
+				client.SendMessage(MessageTypeNewChat, payload)
+			}
+		}
+	}
+}
+
+// BroadcastChatUpdated propagates chat metadata changes such as renames to all participants.
+func (h *Hub) BroadcastChatUpdated(chatID uuid.UUID, name string, participants []*models.PublicUser) {
+	ctx := context.Background()
+	chat, err := h.chatStore.GetChatByID(ctx, chatID)
+	if err != nil {
+		log.Printf("BroadcastChatUpdated: failed to load chat %s: %v", chatID, err)
+		return
+	}
+	chat.Name = name
+
+	if participants == nil {
+		participants, err = h.chatStore.GetAllParticipantsInChat(ctx, chatID)
+		if err != nil {
+			log.Printf("BroadcastChatUpdated: failed to load participants for chat %s: %v", chatID, err)
+			return
+		}
+	}
+
+	h.clientsMux.RLock()
+	defer h.clientsMux.RUnlock()
+
+	for _, participant := range participants {
+		chatCopy := *chat
+		chatCopy.OtherParticipants = filterParticipantsForViewer(participants, participant.ID)
+		payload := ChatUpdatedPayload{Chat: &chatCopy}
+		if userClients, found := h.clients[participant.ID]; found {
+			for client := range userClients {
+				client.SendMessage(MessageTypeChatUpdated, payload)
+			}
+		}
+	}
+}
+
+// BroadcastMessageUpdate notifies all chat members of message edits.
+func (h *Hub) BroadcastMessageUpdate(message *models.Message) {
+	if message == nil {
+		return
+	}
+	ctx := context.Background()
+	participants, err := h.chatStore.GetAllParticipantsInChat(ctx, message.ChatID)
+	if err != nil {
+		log.Printf("BroadcastMessageUpdate: failed to load participants for chat %s: %v", message.ChatID, err)
+		return
+	}
+
+	h.clientsMux.RLock()
+	defer h.clientsMux.RUnlock()
+
+	targetSet := make(map[uuid.UUID]struct{})
+	targetSet[message.SenderID] = struct{}{}
+	for _, participant := range participants {
+		targetSet[participant.ID] = struct{}{}
+	}
+
+	for targetID := range targetSet {
+		if userClients, found := h.clients[targetID]; found {
+			for client := range userClients {
+				client.SendMessage(MessageTypeMessageUpdated, MessageUpdatedPayload{Message: cloneMessage(message)})
+			}
+		}
+	}
+}
+
+// BroadcastMessageDeletion informs participants that a message was removed.
+func (h *Hub) BroadcastMessageDeletion(message *models.Message) {
+	if message == nil {
+		return
+	}
+	ctx := context.Background()
+	participants, err := h.chatStore.GetAllParticipantsInChat(ctx, message.ChatID)
+	if err != nil {
+		log.Printf("BroadcastMessageDeletion: failed to load participants for chat %s: %v", message.ChatID, err)
+		return
+	}
+
+	h.clientsMux.RLock()
+	defer h.clientsMux.RUnlock()
+
+	targetSet := make(map[uuid.UUID]struct{})
+	targetSet[message.SenderID] = struct{}{}
+	for _, participant := range participants {
+		targetSet[participant.ID] = struct{}{}
+	}
+
+	for targetID := range targetSet {
+		if userClients, found := h.clients[targetID]; found {
+			for client := range userClients {
+				client.SendMessage(MessageTypeMessageDeleted, MessageDeletedPayload{Message: cloneMessage(message)})
+			}
+		}
+	}
+}
+
+func cloneMessage(message *models.Message) *models.Message {
+	if message == nil {
+		return nil
+	}
+	msgCopy := *message
+	if message.Sender != nil {
+		senderCopy := *message.Sender
+		msgCopy.Sender = &senderCopy
+	}
+	if message.AttachmentURL != nil {
+		attachmentCopy := *message.AttachmentURL
+		msgCopy.AttachmentURL = &attachmentCopy
+	}
+	if message.DeletedAt != nil {
+		t := *message.DeletedAt
+		msgCopy.DeletedAt = &t
+	}
+	return &msgCopy
+}
+
+func filterParticipantsForViewer(participants []*models.PublicUser, viewer uuid.UUID) []*models.PublicUser {
+	filtered := make([]*models.PublicUser, 0, len(participants))
+	for _, participant := range participants {
+		if participant == nil || participant.ID == viewer {
+			continue
+		}
+		copy := *participant
+		filtered = append(filtered, &copy)
+	}
+	return filtered
 }

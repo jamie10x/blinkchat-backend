@@ -1,13 +1,6 @@
 package main
 
 import (
-	"blinkchat-backend/internal/auth"
-	"blinkchat-backend/internal/chat"
-	"blinkchat-backend/internal/config"
-	"blinkchat-backend/internal/middleware"
-	"blinkchat-backend/internal/store"
-	"blinkchat-backend/internal/user"
-	"blinkchat-backend/internal/websocket" // Make sure this is your actual module path
 	"context"
 	"errors"
 	"log"
@@ -18,13 +11,20 @@ import (
 	"syscall"
 	"time"
 
+	"blinkchat-backend/internal/auth"
+	"blinkchat-backend/internal/chat"
+	"blinkchat-backend/internal/config"
+	"blinkchat-backend/internal/middleware"
+	"blinkchat-backend/internal/store"
+	"blinkchat-backend/internal/user"
+	"blinkchat-backend/internal/websocket"
+
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func main() {
-	// --- 1. Load Configuration ---
 	config.LoadConfig(".env")
 	if config.Cfg == nil {
 		log.Fatal("Error: Configuration not loaded.")
@@ -32,10 +32,9 @@ func main() {
 
 	log.Println("Chat Backend Starting...")
 	log.Printf("Server will run on port: %s", config.Cfg.ServerPort)
-	log.Printf("JWT Secret (first 5 chars for check): %s...", config.Cfg.JWTSecret[:5])
+	log.Printf("JWT Secret (first 5 chars for check): %s...", previewSecret(config.Cfg.JWTSecret))
 	log.Printf("Database URL Host (for check): %s", getDBHostForMain(config.Cfg.DatabaseURL))
 
-	// --- 2. Initialize Database Connection Pool ---
 	dbCtx := context.Background()
 	dbpool, err := pgxpool.New(dbCtx, config.Cfg.DatabaseURL)
 	if err != nil {
@@ -49,7 +48,6 @@ func main() {
 	}
 	log.Println("Successfully connected to the database!")
 
-	// --- 3. Initialize Stores (Repositories) ---
 	userStore := store.NewPostgresUserStore(dbpool)
 	log.Printf("UserStore initialized: %T", userStore)
 	chatStore := store.NewPostgresChatStore(dbpool)
@@ -57,12 +55,10 @@ func main() {
 	messageStore := store.NewPostgresMessageStore(dbpool)
 	log.Printf("MessageStore initialized: %T", messageStore)
 
-	// --- 4. Initialize WebSocket Hub ---
 	wsHub := websocket.NewHub(userStore, chatStore, messageStore)
 	go wsHub.Run()
 	log.Println("WebSocket Hub initialized and running.")
 
-	// --- 5. Initialize Handlers ---
 	authHandler := auth.NewAuthHandler(userStore)
 	log.Printf("AuthHandler initialized: %T", authHandler)
 
@@ -75,7 +71,6 @@ func main() {
 	wsHandler := websocket.NewWSHandler(wsHub)
 	log.Printf("WSHandler initialized: %T", wsHandler)
 
-	// --- 6. Initialize Gin Router ---
 	gin.SetMode(gin.ReleaseMode) // Or gin.DebugMode
 	r := gin.New()
 	r.RedirectTrailingSlash = false
@@ -83,20 +78,16 @@ func main() {
 	r.Use(gin.Recovery())
 
 	corsConfig := cors.DefaultConfig()
-	// CORRECTED: Removed ws:// schemes. Only HTTP/HTTPS origins are valid here.
 	corsConfig.AllowOrigins = []string{"http://localhost:3000", "http://127.0.0.1:3000"}
-	// If you need to allow all for very broad local testing (not recommended for long):
-	// corsConfig.AllowAllOrigins = true
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"}
 	corsConfig.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization", "Upgrade", "Connection"}
 	corsConfig.AllowCredentials = true
-	r.Use(cors.New(corsConfig)) // Line 94 where the panic occurred
+	r.Use(cors.New(corsConfig))
 
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "UP"})
 	})
 
-	// --- Register API Routes ---
 	r.GET("/ws", wsHandler.HandleWebSocketConnection)
 
 	apiV1 := r.Group("/api/v1")
@@ -113,13 +104,19 @@ func main() {
 			protected.GET("/auth/me", authHandler.GetMe)
 			protected.GET("/users/:id", userHandler.GetUserByID)
 			protected.GET("/users", userHandler.SearchUsers)
+			protected.POST("/chats", chatRestHandler.CreateChat)
+			protected.PATCH("/chats/:id", chatRestHandler.UpdateChat)
+			protected.POST("/chats/:id/participants", chatRestHandler.AddParticipants)
+			protected.DELETE("/chats/:id/participants/:userId", chatRestHandler.RemoveParticipant)
+			protected.POST("/chats/:id/read", chatRestHandler.MarkChatRead)
 			protected.POST("/messages", chatRestHandler.PostMessage)
 			protected.GET("/messages", chatRestHandler.GetMessagesByChatID)
+			protected.PATCH("/messages/:id", chatRestHandler.UpdateMessage)
+			protected.DELETE("/messages/:id", chatRestHandler.DeleteMessage)
 			protected.GET("/chats", chatRestHandler.GetChats)
 		}
 	}
 
-	// --- 7. Start HTTP Server with Graceful Shutdown ---
 	srv := &http.Server{
 		Addr:    ":" + config.Cfg.ServerPort,
 		Handler: r,
@@ -145,6 +142,13 @@ func main() {
 	}
 
 	log.Println("Server exiting")
+}
+
+func previewSecret(secret string) string {
+	if len(secret) >= 5 {
+		return secret[:5]
+	}
+	return secret
 }
 
 func getDBHostForMain(dbURL string) string {
